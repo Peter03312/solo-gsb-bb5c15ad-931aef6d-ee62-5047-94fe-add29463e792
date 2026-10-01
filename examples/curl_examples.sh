@@ -9,11 +9,24 @@ set -euo pipefail
 BASE_URL="${BASE_URL:-http://localhost:8000}"
 api() { curl -sS -X "$1" "${BASE_URL}$2" ${3:+-H 'Content-Type: application/json' -d "$3"}; echo; }
 
-echo "== 1. Create a recycling point (IANA timezone) =="
-POINT_JSON="$(api POST /points '{"name":"阳光社区回收点","timezone":"Asia/Shanghai"}')"
+echo "== 1. Create a recycling point (IANA timezone; 1..20 simultaneous slots) =="
+POINT_JSON="$(api POST /points '{"name":"阳光社区回收点","timezone":"Asia/Shanghai","capacity":4}')"
 echo "$POINT_JSON"
 PID="$(echo "$POINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
-echo "point id = $PID"
+echo "point id = $PID (capacity defaults to 1 when omitted)"
+
+echo
+echo "-- read the point back: the response includes capacity --"
+api GET "/points/$PID"
+
+echo
+echo "-- raise capacity from 4 to 6 (200; no waitlist exists yet) --"
+api PATCH "/points/$PID" '{"capacity":6}'
+
+echo
+echo "-- out-of-range capacity is a shape error (422 invalid_request) --"
+api PATCH "/points/$PID" '{"capacity":0}'
+api POST /points '{"name":"too-many","timezone":"UTC","capacity":21}'
 
 echo
 echo "== 2. Publish rules v1 (optimistic on expected_version=0) =="
@@ -306,6 +319,67 @@ api POST "/points/$WPID/reservations/$HOLD_ID/cancel" "{\"cancel_token\":\"$HOLD
 echo
 echo "-- waitlist status now reports promoted + reservation number/cancel token --"
 api GET "/points/$WPID/waitlist/$WID?query_token=$WTOKEN"
+
+echo
+echo "== 8b. Capacity: multiple concurrent visitors, decrease guard, increase sweep =="
+CPOINT_JSON="$(api POST /points '{"name":"容量演示点","timezone":"UTC","capacity":2}')"
+echo "$CPOINT_JSON"
+CPID="$(echo "$CPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$CPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}" >/dev/null
+
+echo
+echo "-- two visitors may share 09:00-10:00 (both 201) --"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-v-1\",
+  \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T10:00:00Z\"}"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-v-2\",
+  \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T10:00:00Z\"}"
+
+echo
+echo "-- a third concurrent visitor is refused with the existing error (409) --"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-v-3\",
+  \"start\": \"${D1}T09:30:00Z\", \"end\": \"${D1}T10:30:00Z\"}"
+
+echo
+echo "-- lowering capacity below the future peak is refused, value unchanged (409) --"
+api PATCH "/points/$CPID" '{"capacity":1}'
+api GET "/points/$CPID"
+
+echo
+echo "-- two applicants queue for the full window (201 waiting) --"
+CW1="$(api POST "/points/$CPID/waitlist" "{
+  \"idempotency_key\": \"cap-w-1\",
+  \"start\": \"${D1}T09:00:00Z\", \"end\": \"${D1}T09:30:00Z\"}")"
+echo "$CW1"
+CW2="$(api POST "/points/$CPID/waitlist" "{
+  \"idempotency_key\": \"cap-w-2\",
+  \"start\": \"${D1}T09:30:00Z\", \"end\": \"${D1}T10:00:00Z\"}")"
+echo "$CW2"
+CWID1="$(echo "$CW1" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+CWTOK1="$(echo "$CW1" | sed -n 's/.*"query_token":"\([^"]*\)".*/\1/p')"
+CWID2="$(echo "$CW2" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+CWTOK2="$(echo "$CW2" | sed -n 's/.*"query_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- raising capacity to 4 promotes every applicant that fits, same transaction --"
+api PATCH "/points/$CPID" '{"capacity":4}'
+api GET "/points/$CPID/waitlist/$CWID1?query_token=$CWTOK1"
+api GET "/points/$CPID/waitlist/$CWID2?query_token=$CWTOK2"
+
+echo
+echo "-- end-to-end touching is free: 10:00-11:00 books independently (201) --"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-touch\",
+  \"start\": \"${D1}T10:00:00Z\", \"end\": \"${D1}T11:00:00Z\"}"
 
 echo
 echo "== 9. Reassign (改派): move a visit to another recycling point =="

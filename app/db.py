@@ -133,19 +133,23 @@ def payload_to_ruleset(payload: dict) -> RuleSet:
 # Points
 # ---------------------------------------------------------------------------
 
-def create_point(cur: psycopg.Cursor, name: str, timezone: str) -> dict:
+_POINT_COLS = "id, name, timezone, version, capacity, created_at, updated_at"
+
+
+def create_point(
+    cur: psycopg.Cursor, name: str, timezone: str, capacity: int = 1
+) -> dict:
     row = cur.execute(
-        "INSERT INTO points (name, timezone) VALUES (%s, %s) "
-        "RETURNING id, name, timezone, version, created_at, updated_at",
-        (name, timezone),
+        "INSERT INTO points (name, timezone, capacity) VALUES (%s, %s, %s) "
+        f"RETURNING {_POINT_COLS}",
+        (name, timezone, capacity),
     ).fetchone()
     return row
 
 
 def get_point(cur: psycopg.Cursor, point_id: int) -> dict:
     row = cur.execute(
-        "SELECT id, name, timezone, version, created_at, updated_at "
-        "FROM points WHERE id = %s",
+        f"SELECT {_POINT_COLS} FROM points WHERE id = %s",
         (point_id,),
     ).fetchone()
     if row is None:
@@ -157,12 +161,11 @@ def lock_point(cur: psycopg.Cursor, point_id: int) -> dict:
     """Lock the point row (FOR UPDATE) and return it, or 404.
 
     Every mutation that can affect reservations (reservation creation, rule
-    publication, timezone change) takes this lock first, so they serialize
-    per point and each sees the other's committed results.
+    publication, timezone / capacity change) takes this lock first, so they
+    serialize per point and each sees the other's committed results.
     """
     row = cur.execute(
-        "SELECT id, name, timezone, version, created_at, updated_at "
-        "FROM points WHERE id = %s FOR UPDATE",
+        f"SELECT {_POINT_COLS} FROM points WHERE id = %s FOR UPDATE",
         (point_id,),
     ).fetchone()
     if row is None:
@@ -176,7 +179,7 @@ def update_point(cur: psycopg.Cursor, point_id: int, **fields) -> dict:
     params = list(fields.values()) + [point_id]
     row = cur.execute(
         f"UPDATE points SET {', '.join(assignments)} WHERE id = %s "
-        f"RETURNING id, name, timezone, version, created_at, updated_at",
+        f"RETURNING {_POINT_COLS}",
         params,
     ).fetchone()
     if row is None:
@@ -411,6 +414,87 @@ def find_overlapping(
         "AND start_utc < %s AND end_utc > %s ORDER BY id",
         (point_id, exclude_reservation_id, end_utc, start_utc),
     ).fetchall()
+
+
+def window_peak_concurrency(
+    cur: psycopg.Cursor,
+    point_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    exclude_reservation_id: int | None = None,
+) -> int:
+    """Peak number of active reservations covering any instant of the window.
+
+    Capacity is computed over the half-open window ``[start_utc, end_utc)``:
+    a reservation is occupied on ``[start_utc, end_utc)`` and touching is
+    free (an end exactly at an instant is released before a start at that
+    same instant).  The concurrency can only change at a reservation start,
+    so the maximum is taken at the window start and at every reservation
+    start lying inside the window — reservations that began before the
+    window and continue into it are counted at the window start.  When
+    rescheduling, the reservation's own row is ignored.
+    """
+    exclude_clause = ""
+    params: list = [point_id]
+    if exclude_reservation_id is not None:
+        exclude_clause = "AND id <> %s"
+        params.append(exclude_reservation_id)
+    initial = cur.execute(
+        "SELECT COUNT(*) AS n FROM reservations "
+        f"WHERE point_id = %s AND status = 'active' {exclude_clause} "
+        "AND start_utc <= %s AND end_utc > %s",
+        (*params, start_utc, start_utc),
+    ).fetchone()["n"]
+    peak = cur.execute(
+        "WITH starts AS ("
+        "  SELECT start_utc AS t FROM reservations "
+        f"  WHERE point_id = %s AND status = 'active' {exclude_clause} "
+        "    AND start_utc >= %s AND start_utc < %s"
+        ") "
+        "SELECT COALESCE(MAX(c), 0) AS peak FROM ("
+        "  SELECT s.t, "
+        "    (SELECT COUNT(*) FROM reservations r "
+        f"    WHERE r.point_id = %s AND r.status = 'active' {exclude_clause} "
+        "      AND r.start_utc <= s.t AND r.end_utc > s.t"
+        ") AS c"
+        "  FROM starts s"
+        ") counted",
+        (*params, start_utc, end_utc, *params),
+    ).fetchone()["peak"]
+    return max(initial, peak)
+
+
+def future_peak_concurrency(
+    cur: psycopg.Cursor, point_id: int, now: datetime
+) -> int:
+    """Peak active concurrency at any instant ``t >= now`` (future or ongoing).
+
+    Used to validate a capacity decrease: the new capacity must exceed the
+    concurrency at every instant not yet finished.  End events before start
+    events at equal timestamps keep touching reservations compatible.
+    """
+    initial = cur.execute(
+        "SELECT COUNT(*) AS n FROM reservations "
+        "WHERE point_id = %s AND status = 'active' "
+        "AND start_utc <= %s AND end_utc > %s",
+        (point_id, now, now),
+    ).fetchone()["n"]
+    peak = cur.execute(
+        "WITH starts AS ("
+        "  SELECT start_utc AS t FROM reservations "
+        "  WHERE point_id = %s AND status = 'active' AND start_utc > %s"
+        ") "
+        "SELECT COALESCE(MAX(c), 0) AS peak FROM ("
+        "  SELECT s.t, "
+        "    (SELECT COUNT(*) FROM reservations r "
+        "    WHERE r.point_id = %s AND r.status = 'active' "
+        "      AND r.start_utc <= s.t AND r.end_utc > s.t) AS c"
+        "  FROM starts s"
+        ") counted",
+        (point_id, now, point_id),
+    ).fetchone()["peak"]
+    return max(initial, peak)
 
 
 def get_reschedule_by_key(
@@ -703,26 +787,31 @@ def promote_waitlist(
     point: dict,
     rules_row: dict,
     now: datetime,
-) -> dict | None:
-    """Process this point's waitlist after a cancel/reschedule release.
+) -> list[dict]:
+    """Process this point's waitlist after a capacity release.
 
     Runs inside the caller's transaction while the point row is locked, so the
-    released window, the waitlist queue and any concurrent reservation
+    released capacity, the waitlist queue and any concurrent reservation
     creation/reschedule serialize together.
 
-    Waiting entries are scanned in application order (``id``):
+    Waiting entries are scanned once in application order (``id``):
 
     * an entry whose start time has already passed is marked ``expired``;
-    * an entry that is not open under the *currently published* rules, or that
-      still overlaps an active reservation, stays queued (``waiting``);
-    * the earliest entry that is open and free is converted into a reservation
-      exactly once, using a server-generated reservation idempotency key and
-      the rules version of the *promotion* moment.
+    * an entry that is not open under the *currently published* rules, or whose
+      window would exceed the point's capacity against the currently active
+      reservations (including entries promoted earlier in this same sweep),
+      stays queued (``waiting``);
+    * every entry that is open and fits is converted into a reservation, using
+      a server-generated reservation idempotency key and the rules version of
+      the *promotion* moment.  One release (or a capacity increase) may
+      therefore promote several entries, in application order; an entry that
+      does not fit yet is skipped and keeps waiting even if a later applicant
+      happens to fit.
 
-    At most one promotion happens per sweep (one release frees one slot).
-    Returns the promoted entry row (with its new reservation id) or None.
+    Returns the promoted entry rows (with their new reservation ids) in order.
     """
     point_id = point["id"]
+    capacity = point["capacity"]
     zone = get_zone(point["timezone"])
     ruleset = payload_to_ruleset(rules_row["payload"])
     rules_version = rules_row["version"]
@@ -732,7 +821,7 @@ def promote_waitlist(
         "WHERE point_id = %s AND status = 'waiting' ORDER BY id",
         (point_id,),
     ).fetchall()
-    promoted = None
+    promoted = []
     for entry in entries:
         start = entry["start_utc"]
         end = entry["end_utc"]
@@ -748,10 +837,13 @@ def promote_waitlist(
             point["timezone"], ruleset, date_from, date_to
         )
         is_open = any(s <= start and end <= e for s, e in intervals)
-        # Against the post-release set of active reservations: touching is
-        # allowed, strictly overlapping means the entry must keep waiting.
-        still_busy = find_overlapping(cur, point_id, start, end)
-        if not is_open or still_busy:
+        # Against the post-release set of active reservations — including any
+        # waitlist entries promoted earlier in this same sweep — the window
+        # must keep every instant of [start, end) strictly below capacity.
+        # Touching is free, so an interval ending exactly at ``start`` does
+        # not count against the entry.
+        peak = window_peak_concurrency(cur, point_id, start, end)
+        if not is_open or peak >= capacity:
             # Not currently promotable: leave it in the queue and keep
             # checking later applicants — one of them may already fit.
             continue
@@ -768,11 +860,12 @@ def promote_waitlist(
             "reservation_id = %s WHERE id = %s AND status = 'waiting'",
             (reservation["id"], entry["id"]),
         )
-        promoted = cur.execute(
-            f"SELECT {_WAITLIST_COLS} FROM waitlist_entries WHERE id = %s",
-            (entry["id"],),
-        ).fetchone()
-        break
+        promoted.append(
+            cur.execute(
+                f"SELECT {_WAITLIST_COLS} FROM waitlist_entries WHERE id = %s",
+                (entry["id"],),
+            ).fetchone()
+        )
     return promoted
 
 

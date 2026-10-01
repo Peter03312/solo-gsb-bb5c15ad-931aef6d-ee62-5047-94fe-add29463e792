@@ -568,6 +568,112 @@ def main() -> None:
         after_cancel,
     )
 
+    # ------------------------------------------------------------------
+    # Capacity (同时接待名额): 1..20 concurrent slots per point, default 1.
+    # Booking/reschedule/reassign/trips/waitlist promotions all share the
+    # half-open [start, end) concurrency rule; capacity increases sweep the
+    # waitlist in the same transaction.
+    # ------------------------------------------------------------------
+    status, cap_point = call(
+        "POST", "/points", {"name": "容量演示点", "timezone": "UTC", "capacity": 2}
+    )
+    show("create a point with capacity 2 (1..20; default is 1)", status, cap_point)
+    cpid = cap_point["id"]
+    call(
+        "POST",
+        f"/points/{cpid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": weekday, "start_time": "08:00", "end_time": "12:00"}
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+
+    status, v1 = call(
+        "POST",
+        f"/points/{cpid}/reservations",
+        {
+            "idempotency_key": "cap-v-1",
+            "start": f"{tomorrow}T09:00:00Z",
+            "end": f"{tomorrow}T10:00:00Z",
+        },
+    )
+    show("first concurrent visitor (201)", status, v1)
+    status, v2 = call(
+        "POST",
+        f"/points/{cpid}/reservations",
+        {
+            "idempotency_key": "cap-v-2",
+            "start": f"{tomorrow}T09:00:00Z",
+            "end": f"{tomorrow}T10:00:00Z",
+        },
+    )
+    show("second concurrent visitor (201)", status, v2)
+    status, v3 = call(
+        "POST",
+        f"/points/{cpid}/reservations",
+        {
+            "idempotency_key": "cap-v-3",
+            "start": f"{tomorrow}T09:30:00Z",
+            "end": f"{tomorrow}T10:30:00Z",
+        },
+    )
+    show("third concurrent visitor rejected (409 reservation_overlap)", status, v3)
+    status, touch = call(
+        "POST",
+        f"/points/{cpid}/reservations",
+        {
+            "idempotency_key": "cap-touch",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T10:30:00Z",
+        },
+    )
+    show("touching end-to-end is free under [start, end) (201)", status, touch)
+
+    status, lowered = call("PATCH", f"/points/{cpid}", {"capacity": 1})
+    show(
+        "lowering below the future peak concurrency is refused (409)",
+        status,
+        lowered,
+    )
+    status, readback = call("GET", f"/points/{cpid}")
+    show("capacity is unchanged", status, readback)
+
+    # Two applicants queue for the full window, then an increase promotes both.
+    _, w_a = call(
+        "POST",
+        f"/points/{cpid}/waitlist",
+        {
+            "idempotency_key": "cap-w-a",
+            "start": f"{tomorrow}T09:00:00Z",
+            "end": f"{tomorrow}T09:30:00Z",
+        },
+    )
+    _, w_b = call(
+        "POST",
+        f"/points/{cpid}/waitlist",
+        {
+            "idempotency_key": "cap-w-b",
+            "start": f"{tomorrow}T09:30:00Z",
+            "end": f"{tomorrow}T10:00:00Z",
+        },
+    )
+    status, raised = call("PATCH", f"/points/{cpid}", {"capacity": 4})
+    show("raising capacity (200) sweeps the waitlist in the same txn", status, raised)
+    status, a_state = call(
+        "GET", f"/points/{cpid}/waitlist/{w_a['id']}?query_token={w_a['query_token']}"
+    )
+    show("first applicant promoted", status, a_state)
+    status, b_state = call(
+        "GET", f"/points/{cpid}/waitlist/{w_b['id']}?query_token={w_b['query_token']}"
+    )
+    show("second applicant promoted", status, b_state)
+
 
 if __name__ == "__main__":
     main()

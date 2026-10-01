@@ -90,6 +90,13 @@ class ReservationChangeConflictError(ApiError):
     code = "reservation_change_conflict"
 
 
+class CapacityConflictError(ApiError):
+    """A capacity decrease below future non-cancelled concurrency is refused."""
+
+    status_code = 409
+    code = "capacity_conflict"
+
+
 class RevisionConflictError(ApiError):
     """Reschedule expected_revision does not match the reservation's revision."""
 

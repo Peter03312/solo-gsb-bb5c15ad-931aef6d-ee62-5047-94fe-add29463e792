@@ -53,11 +53,27 @@ class PublishRulesIn(BaseModel):
 class PointCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     timezone: str
+    capacity: int = Field(
+        default=1,
+        ge=1,
+        le=20,
+        description="Simultaneous reception slots (1..20); existing points default to 1.",
+    )
 
 
 class PointUpdateIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     timezone: str | None = None
+    capacity: int | None = Field(
+        default=None,
+        ge=1,
+        le=20,
+        description=(
+            "New simultaneous reception capacity (1..20). A decrease below the "
+            "future non-cancelled concurrency is refused; an increase promotes "
+            "currently fitting waitlist entries in the same transaction."
+        ),
+    )
 
 
 class ReservationCreateIn(BaseModel):
@@ -332,6 +348,7 @@ class PointOut(BaseModel):
     name: str
     timezone: str
     version: int
+    capacity: int
     created_at: datetime
     updated_at: datetime
 

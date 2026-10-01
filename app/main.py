@@ -16,6 +16,7 @@ from . import db
 from .config import settings
 from .errors import ApiError
 from .errors import (
+    CapacityConflictError,
     IdempotencyConflictError,
     InvalidPeriodError,
     InvalidRequestError,
@@ -130,7 +131,9 @@ def create_point(body: PointCreateIn) -> PointOut:
     validate_timezone(body.timezone)
     with db.conn() as connection:
         with connection.transaction():
-            row = db.create_point(connection.cursor(), body.name, body.timezone)
+            row = db.create_point(
+                connection.cursor(), body.name, body.timezone, body.capacity
+            )
     return PointOut(**row)
 
 
@@ -149,18 +152,55 @@ def patch_point(point_id: int, body: PointUpdateIn) -> PointOut:
     with db.conn() as connection:
         with connection.transaction():
             cur = connection.cursor()
-            if "timezone" in fields:
+            capacity_increase = False
+            if "timezone" in fields or "capacity" in fields:
                 # A timezone change re-interprets every wall-clock rule; it is
-                # refused when it would un-cover an active reservation.  The
-                # point row lock serializes this check against concurrent
-                # reservation creations.
-                db.lock_point(cur, point_id)
+                # refused when it would un-cover an active reservation.  A
+                # capacity decrease is refused when any future instant is
+                # already booked at least as full as the new capacity.  The
+                # point row lock serializes both checks against concurrent
+                # reservation creations; it also serializes the waitlist
+                # sweep that a capacity increase triggers below.
+                point = db.lock_point(cur, point_id)
+                if "timezone" in fields:
+                    latest = db.get_latest_payload(cur, point_id)
+                    if latest is not None:
+                        db.assert_reservations_fit(
+                            cur, point_id, fields["timezone"], latest["payload"]
+                        )
+                if "capacity" in fields:
+                    new_capacity = fields["capacity"]
+                    if new_capacity < point["capacity"]:
+                        peak = db.future_peak_concurrency(
+                            cur, point_id, datetime.now(timezone.utc)
+                        )
+                        if peak > new_capacity:
+                            raise CapacityConflictError(
+                                f"capacity of point {point_id} cannot be lowered "
+                                f"to {new_capacity}: {peak} non-cancelled "
+                                f"reservation(s) already coincide at some future "
+                                f"instant",
+                                details={
+                                    "point_id": point_id,
+                                    "requested_capacity": new_capacity,
+                                    "current_capacity": point["capacity"],
+                                    "future_peak_concurrency": peak,
+                                },
+                            )
+                    capacity_increase = new_capacity > point["capacity"]
+            row = db.update_point(cur, point_id, **fields)
+            if capacity_increase:
+                # Newly opened capacity: in the same transaction, promote the
+                # earliest waitlist entries that now fit.  If the sweep
+                # fails, the capacity change rolls back together with it.
                 latest = db.get_latest_payload(cur, point_id)
                 if latest is not None:
-                    db.assert_reservations_fit(
-                        cur, point_id, fields["timezone"], latest["payload"]
+                    point["capacity"] = row["capacity"]
+                    if "timezone" in fields:
+                        point["timezone"] = row["timezone"]
+                    db.promote_waitlist(
+                        cur, point, latest, datetime.now(timezone.utc)
                     )
-            row = db.update_point(cur, point_id, **fields)
     return PointOut(**row)
 
 
@@ -351,6 +391,47 @@ def _reservation_state_out(row: dict) -> ReservationStateOut:
     )
 
 
+def _assert_window_has_capacity(
+    cur,
+    point: dict,
+    start: datetime,
+    end: datetime,
+    *,
+    exclude_reservation_id: int | None = None,
+) -> None:
+    """Reject a window unless every instant of ``[start, end)`` is below cap.
+
+    Capacity counts non-cancelled reservations by the half-open interval rule:
+    touching end-to-end is free and a reservation starting exactly at ``start``
+    is already counted.  The refusal keeps the existing
+    ``reservation_overlap`` error code and its ``conflicting_reservation_ids``
+    detail, extended with the point's capacity and the window's peak.
+    """
+    peak = db.window_peak_concurrency(
+        cur,
+        point["id"],
+        start,
+        end,
+        exclude_reservation_id=exclude_reservation_id,
+    )
+    if peak >= point["capacity"]:
+        overlapping = db.find_overlapping(
+            cur,
+            point["id"],
+            start,
+            end,
+            exclude_reservation_id=exclude_reservation_id,
+        )
+        raise ReservationOverlapError(
+            "reservation window is at the point's capacity for some instant",
+            details={
+                "conflicting_reservation_ids": [r["id"] for r in overlapping],
+                "capacity": point["capacity"],
+                "peak_concurrency": peak,
+            },
+        )
+
+
 @app.post(
     "/points/{point_id}/reservations",
     response_model=ReservationOut,
@@ -426,14 +507,7 @@ def create_reservation(
                     },
                 )
 
-            overlapping = db.find_overlapping(cur, point_id, start, end)
-            if overlapping:
-                raise ReservationOverlapError(
-                    "reservation overlaps an existing active reservation",
-                    details={
-                        "conflicting_reservation_ids": [r["id"] for r in overlapping]
-                    },
-                )
+            _assert_window_has_capacity(cur, point, start, end)
 
             row = db.insert_reservation(
                 cur,
@@ -465,9 +539,10 @@ def cancel_reservation(
                 cur, point_id, reservation_id, body.cancel_token
             )
             if released:
-                # A slot actually opened: promote the earliest eligible
-                # waitlist entry in the same transaction.  If promotion fails,
-                # the cancellation is rolled back together with it.
+                # A slot actually opened: promote, in application order, every
+                # waitlist entry that now fits, all in the same
+                # transaction.  If a promotion fails, the cancellation is
+                # rolled back together with the sweep.
                 _, rules_row = db.get_current_rules(cur, point_id)
                 db.promote_waitlist(
                     cur, point, rules_row, datetime.now(timezone.utc)
@@ -608,23 +683,11 @@ def reschedule_reservation(
                     },
                 )
 
-            # Overlap against other active reservations; this reservation's
+            # Capacity against other active reservations; this reservation's
             # own (still held) old window is ignored.
-            overlapping = db.find_overlapping(
-                cur,
-                point_id,
-                start,
-                end,
-                exclude_reservation_id=reservation_id,
+            _assert_window_has_capacity(
+                cur, point, start, end, exclude_reservation_id=resv["id"]
             )
-            if overlapping:
-                raise ReservationOverlapError(
-                    "rescheduled window overlaps another active reservation",
-                    details={
-                        "conflicting_reservation_ids": [r["id"]]
-                        for r in overlapping
-                    },
-                )
 
             attempt = db.apply_reschedule(
                 cur,
@@ -636,9 +699,9 @@ def reschedule_reservation(
                 rules_row["version"],
             )
             # Moving away frees the old window: in the same transaction,
-            # promote the earliest waitlist entry that now fits.  A failure
-            # here rolls the reschedule back as well, so the old window stays
-            # occupied.
+            # promote every waitlist entry that now fits, in application
+            # order.  A failure here rolls the reschedule back as well,
+            # so the old window stays occupied.
             db.promote_waitlist(cur, point, rules_row, now)
             # Rescheduling only moves the window and bumps the revision;
             # status / cancel token / created_at are unchanged, so the locked
@@ -771,8 +834,8 @@ def reassign_reservation(
 
             # The target window follows the same booking policy as an
             # ordinary reservation: lead time, duration, one continuous open
-            # interval of the target point's currently published calendar,
-            # and no overlap with that point's active reservations.
+            # interval of the target point's currently published calendar, and spare
+            # capacity on that point for every instant of the new window.
             validate_reservation_window(
                 start,
                 end,
@@ -803,16 +866,7 @@ def reassign_reservation(
                         "rules_version": target_rules["version"],
                     },
                 )
-            overlapping = db.find_overlapping(cur, body.target_point_id, start, end)
-            if overlapping:
-                raise ReservationOverlapError(
-                    "reassigned window overlaps an active reservation at the "
-                    "target point",
-                    details={
-                        "conflicting_reservation_ids": [r["id"]]
-                        for r in overlapping
-                    },
-                )
+            _assert_window_has_capacity(cur, target_point, start, end)
 
             # All validations passed: cancel the source reservation (this
             # releases its window) and, per the existing release rules, try
@@ -957,17 +1011,23 @@ def create_waitlist_entry(
                     },
                 )
 
-            # The waitlist is only for windows that are already taken: it must
-            # overlap at least one active, non-cancelled reservation.  A free
-            # window keeps going through the ordinary reservation flow.
-            if not db.find_overlapping(cur, point_id, start, end):
+            # The waitlist is only for calendar-valid windows that are
+            # already at capacity: some instant of the window must be holding
+            # as many non-cancelled reservations as the point allows.  A
+            # window with room to spare keeps going through the ordinary
+            # reservation flow.  Capacity follows the half-open [start, end)
+            # rule, so a window that merely touches active reservations is still free.
+            peak = db.window_peak_concurrency(cur, point_id, start, end)
+            if peak < point["capacity"]:
                 raise WaitlistWindowAvailableError(
-                    "the requested window is currently open for booking; use "
+                    "the requested window currently has free capacity; use "
                     "the reservation endpoint instead of the waitlist",
                     details={
                         "start": utc_iso(start),
                         "end": utc_iso(end),
                         "rules_version": rules_row["version"],
+                        "capacity": point["capacity"],
+                        "peak_concurrency": peak,
                     },
                 )
 
@@ -1179,9 +1239,9 @@ def create_trip(body: TripCreateIn, response: Response) -> TripOut:
 
             # Validate every stop in visit order against the same rules as a
             # single reservation (booking window, one continuous open
-            # interval of the currently published calendar, no overlap with
-            # active reservations).  The first failure aborts the whole
-            # group: the transaction rolls back and nothing is stored.
+            # interval of the currently published calendar, per-point
+            # capacity over [start, end)).  The first failure aborts the
+            # whole group: the transaction rolls back and nothing is stored.
             plan = []
             for index, stop in enumerate(body.stops):
                 start, end = windows[index]
@@ -1215,19 +1275,7 @@ def create_trip(body: TripCreateIn, response: Response) -> TripOut:
                                 "rules_version": rules_row["version"],
                             },
                         )
-                    overlapping = db.find_overlapping(
-                        cur, stop.point_id, start, end
-                    )
-                    if overlapping:
-                        raise ReservationOverlapError(
-                            "reservation overlaps an existing active "
-                            "reservation",
-                            details={
-                                "conflicting_reservation_ids": [
-                                    r["id"] for r in overlapping
-                                ]
-                            },
-                        )
+                    _assert_window_has_capacity(cur, point, start, end)
                 except ApiError as exc:
                     raise _stop_scoped(exc, index, stop.point_id)
                 plan.append(

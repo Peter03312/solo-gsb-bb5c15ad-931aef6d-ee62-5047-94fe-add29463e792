@@ -6,9 +6,26 @@ CREATE TABLE IF NOT EXISTS points (
     name        TEXT NOT NULL,
     timezone    TEXT NOT NULL,                 -- IANA tz database name
     version     INTEGER NOT NULL DEFAULT 0,    -- number of published versions
+    capacity    INTEGER NOT NULL DEFAULT 1,    -- simultaneous reception slots (1..20)
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Upgrade path for databases created before per-point capacity existed:
+-- existing points default to one simultaneous slot (the old overlap rule).
+-- The CHECK is added once (by its stable name) for both fresh and upgraded
+-- databases, so re-running this script stays idempotent.
+ALTER TABLE points ADD COLUMN IF NOT EXISTS capacity INTEGER NOT NULL DEFAULT 1;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'points_capacity_check'
+    ) THEN
+        ALTER TABLE points
+            ADD CONSTRAINT points_capacity_check CHECK (capacity BETWEEN 1 AND 20);
+    END IF;
+END
+$$;
 
 -- One row per *published* rule set.  Version 0 means "no rules yet" and is
 -- never present; the point's current version always points at the newest row.
