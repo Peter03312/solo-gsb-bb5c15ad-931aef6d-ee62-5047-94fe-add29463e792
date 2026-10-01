@@ -475,3 +475,76 @@ echo
 echo "-- cancel one stop with its own token (200); the group replay still works --"
 api POST "/points/$APID/reservations/$TRIP_RID/cancel" "{\"cancel_token\":\"$TRIP_TOKEN\"}"
 api POST /trips "$TRIP_BODY"
+
+echo
+echo "== 11. Capacity (容量): 1..20 concurrent visitors per point =="
+# A fresh point with 2 simultaneous reception slots, open 08:00-12:00 tomorrow.
+CPOINT_JSON="$(api POST /points "{\"name\":\"容量演示点\",\"timezone\":\"UTC\",\"capacity\":2}")"
+echo "$CPOINT_JSON"
+CPID="$(echo "$CPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$CPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- read the point: capacity is returned (old points default to 1) --"
+api GET "/points/$CPID"
+
+echo
+echo "-- two overlapping bookings both succeed (capacity 2) --"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-visit-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-visit-2\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}"
+
+echo
+echo "-- a third concurrent visitor is refused with the occupation error --"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-visit-3\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}"
+
+echo
+echo "-- back-to-back windows share no instant and still coexist --"
+api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"cap-visit-touch\",
+  \"start\": \"${D1}T09:30:00Z\",
+  \"end\": \"${D1}T10:00:00Z\"
+}"
+
+echo
+echo "-- the full window can be waitlisted; a window with seats left cannot --"
+CAP_WAIT_JSON="$(api POST "/points/$CPID/waitlist" "{
+  \"idempotency_key\": \"cap-wait-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}")"
+echo "$CAP_WAIT_JSON"
+CAP_WID="$(echo "$CAP_WAIT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+CAP_WTOKEN="$(echo "$CAP_WAIT_JSON" | sed -n 's/.*"query_token":"\([^"]*\)".*/\1/p')"
+api POST "/points/$CPID/waitlist" "{
+  \"idempotency_key\": \"cap-wait-free\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- lowering capacity to 1 is refused while 2 future bookings overlap --"
+api PATCH "/points/$CPID" '{"capacity":1}'
+
+echo
+echo "-- raising capacity to 3 promotes the queued applicant in the same transaction --"
+api PATCH "/points/$CPID" '{"capacity":3}'
+api GET "/points/$CPID/waitlist/$CAP_WID?query_token=$CAP_WTOKEN"

@@ -6,9 +6,22 @@ CREATE TABLE IF NOT EXISTS points (
     name        TEXT NOT NULL,
     timezone    TEXT NOT NULL,                 -- IANA tz database name
     version     INTEGER NOT NULL DEFAULT 0,    -- number of published versions
+    -- How many visitors the point receives concurrently.  Booking a window is
+    -- allowed only when every instant of [start, end) stays strictly below
+    -- capacity; existing points default to one concurrent visitor.
+    capacity    INTEGER NOT NULL DEFAULT 1
+                CHECK (capacity BETWEEN 1 AND 20),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Upgrade path for databases created before per-point capacity existed.
+ALTER TABLE points
+    ADD COLUMN IF NOT EXISTS capacity INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE points
+    DROP CONSTRAINT IF EXISTS points_capacity_check;
+ALTER TABLE points
+    ADD CONSTRAINT points_capacity_check CHECK (capacity BETWEEN 1 AND 20);
 
 -- One row per *published* rule set.  Version 0 means "no rules yet" and is
 -- never present; the point's current version always points at the newest row.

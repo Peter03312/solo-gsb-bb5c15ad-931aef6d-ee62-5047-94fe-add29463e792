@@ -97,6 +97,13 @@ class RevisionConflictError(ApiError):
     code = "revision_conflict"
 
 
+class CapacityConflictError(ApiError):
+    """Lowering a point's capacity below its future concurrent bookings."""
+
+    status_code = 409
+    code = "capacity_conflict"
+
+
 class ReservationNotReschedulableError(ApiError):
     """The reservation cannot be rescheduled (cancelled or already started)."""
 

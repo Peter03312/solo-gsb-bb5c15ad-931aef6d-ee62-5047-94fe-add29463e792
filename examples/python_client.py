@@ -568,6 +568,107 @@ def main() -> None:
         after_cancel,
     )
 
+    # ------------------------------------------------------------------
+    # Capacity (容量): 1..20 concurrent visitors per recycling point.
+    # A fresh point with two reception slots.
+    # ------------------------------------------------------------------
+    status, cap_point = call(
+        "POST",
+        "/points",
+        {"name": "容量演示点", "timezone": "UTC", "capacity": 2},
+    )
+    show("create a point with capacity 2", status, cap_point)
+    cpid = cap_point["id"]
+    status, published = call(
+        "POST",
+        f"/points/{cpid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": weekday, "start_time": "08:00", "end_time": "12:00"}
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+    show("publish open hours for the capacity point", status, published)
+
+    status, read_back = call("GET", f"/points/{cpid}")
+    show("capacity is returned when reading the point", status, read_back)
+
+    booked = []
+    for key in ("cap-visit-1", "cap-visit-2"):
+        status, created = call(
+            "POST",
+            f"/points/{cpid}/reservations",
+            {
+                "idempotency_key": key,
+                "start": f"{tomorrow}T09:00:00Z",
+                "end": f"{tomorrow}T09:30:00Z",
+            },
+        )
+        show(f"concurrent booking {key} (up to capacity 2)", status, created)
+        booked.append(created)
+
+    status, full = call(
+        "POST",
+        f"/points/{cpid}/reservations",
+        {
+            "idempotency_key": "cap-visit-3",
+            "start": f"{tomorrow}T09:00:00Z",
+            "end": f"{tomorrow}T09:30:00Z",
+        },
+    )
+    show("a third concurrent visitor is refused (same occupation error)", status, full)
+
+    status, touching = call(
+        "POST",
+        f"/points/{cpid}/reservations",
+        {
+            "idempotency_key": "cap-visit-touch",
+            "start": f"{tomorrow}T09:30:00Z",
+            "end": f"{tomorrow}T10:00:00Z",
+        },
+    )
+    show("a back-to-back window shares no instant and still books", status, touching)
+
+    status, waiting = call(
+        "POST",
+        f"/points/{cpid}/waitlist",
+        {
+            "idempotency_key": "cap-wait-1",
+            "start": f"{tomorrow}T09:00:00Z",
+            "end": f"{tomorrow}T09:30:00Z",
+        },
+    )
+    show("the full window joins the waitlist", status, waiting)
+    cap_wid, cap_wtoken = waiting["id"], waiting["query_token"]
+
+    status, free_window = call(
+        "POST",
+        f"/points/{cpid}/waitlist",
+        {
+            "idempotency_key": "cap-wait-free",
+            "start": f"{tomorrow}T11:00:00Z",
+            "end": f"{tomorrow}T11:30:00Z",
+        },
+    )
+    show("a window with seats left is not waitlistable", status, free_window)
+
+    status, lowered = call("PATCH", f"/points/{cpid}", {"capacity": 1})
+    show("lowering below future concurrency is refused (value unchanged)", status, lowered)
+
+    status, raised = call("PATCH", f"/points/{cpid}", {"capacity": 3})
+    show("raising capacity promotes the queued applicant atomically", status, raised)
+
+    status, promoted_state = call(
+        "GET",
+        f"/points/{cpid}/waitlist/{cap_wid}?query_token={cap_wtoken}",
+    )
+    show("the queued application is now promoted", status, promoted_state)
+
 
 if __name__ == "__main__":
     main()
